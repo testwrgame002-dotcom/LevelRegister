@@ -132,7 +132,7 @@ async function loadUserGPs() {
 async function loadUserGPsCached() {
   const now = Date.now();
 
-  if (gpCache && now - gpLastFetch < 60000) {
+  if (gpCache && now - gpLastFetch < 300000) {
     return gpCache;
   }
 
@@ -343,11 +343,22 @@ async function redisGetJSON(key, fallback = {}) {
   }
 }
 
-async function redisSetJSON(key, value) {
+const lastSavedJson = new Map();
+
+async function redisSetJSON(key, value, force = false) {
   try {
-    await redis.set(key, JSON.stringify(value || {}));
+    const json = JSON.stringify(value || {});
+
+    if (!force && lastSavedJson.get(key) === json) {
+      return false;
+    }
+
+    await redis.set(key, json);
+    lastSavedJson.set(key, json);
+    return true;
   } catch (err) {
     console.error(`❌ Error guardando Redis key ${key}:`, err);
+    return false;
   }
 }
 const PROFILE_IMAGE_FIELDS = [
@@ -514,25 +525,50 @@ let lastRun = Date.now();
 
 let groupOnlineMap = {};  // 🔥 GLOBAL
 
+let trackingDirty = false;
+let panelsDirty = false;
+let settingsDirty = false;
+let profilesDirty = false;
+
+let lastTrackingSave = 0;
+let lastRankingUpdate = 0;
+let lastPanelsUpdate = 0;
+let lastOnlineFetch = 0;
+let lastHeartbeatScan = 0;
+
+const ONLINE_CACHE_MS = 300000;       // 5 minutos
+const TRACKING_SAVE_MS = 600000;      // 10 minutos
+const PANEL_UPDATE_MS = 600000;       // 10 minutos
+const RANKING_UPDATE_MS = 1800000;    // 30 minutos
+const HEARTBEAT_SCAN_MS = 600000;     // 10 minutos
+const BACKUP_SAVE_MS = 3600000;       // 1 hora
+
 let panelSaveTimeout;
 function savePanels() {
+  panelsDirty = true;
+
   clearTimeout(panelSaveTimeout);
   panelSaveTimeout = setTimeout(() => {
+    panelsDirty = false;
     redisSetJSON("user_panels", userPanels);
-  }, 2000);
+  }, 15000);
 }
-
 function saveSettings() {
+  settingsDirty = true;
+
   clearTimeout(saveTimeout);
   saveTimeout = setTimeout(() => {
+    settingsDirty = false;
     redisSetJSON("panel_settings", userSettings);
-  }, 2000);
+  }, 30000);
 }
+
 // =============================
 // ⚡ CACHE DE IMÁGENES
 // =============================
 const imageCache = new Map();
 const profileImageCache = new Map();
+const profilePostCache = new Map();
 
 function profileImageCacheKey(id, field) {
   return `${id}:${field}`;
@@ -579,13 +615,17 @@ let saveTimeout;
 let profileSaveTimeout;
 
 function saveProfiles() {
+  profilesDirty = true;
+
   clearTimeout(profileSaveTimeout);
   profileSaveTimeout = setTimeout(() => {
+    profilesDirty = false;
     redisSetJSON("user_profiles", userProfiles);
-  }, 2000);
+  }, 30000);
 }
 async function saveProfilesNow() {
   clearTimeout(profileSaveTimeout);
+  profilesDirty = false;
   await redisSetJSON("user_profiles", userProfiles);
 }
 async function imageUrlToCompressedBase64(url, options = {}) {
@@ -746,6 +786,22 @@ function buildProfileButton(post, username = "user") {
       .setStyle(ButtonStyle.Link)
       .setURL(getProfilePostUrl(post))
   );
+}
+///aqui
+async function getProfilePostCached(postId) {
+  if (!postId) return null;
+
+  if (profilePostCache.has(postId)) {
+    return profilePostCache.get(postId);
+  }
+
+  const post = await client.channels.fetch(postId).catch(() => null);
+
+  if (post) {
+    profilePostCache.set(postId, post);
+  }
+
+  return post;
 }
 // =============================
 function getUserRoleByGroup(group) {
@@ -918,7 +974,7 @@ await runTrackingCycle();
 await scanHeartbeats();
 await updateRanking();
 
-await redisSetJSON("tracking_data", trackingData);
+trackingDirty = true;
 
   console.log("✅ Datos sincronizados al iniciar");
 
@@ -927,7 +983,14 @@ await redisSetJSON("tracking_data", trackingData);
   // 7️⃣ INICIAR LOOPS
   // =============================
   startLoop();
-  setInterval(scanHeartbeats, 300000);
+ setInterval(async () => {
+  const now = Date.now();
+
+  if (now - lastHeartbeatScan >= HEARTBEAT_SCAN_MS) {
+    lastHeartbeatScan = now;
+    await scanHeartbeats();
+  }
+}, 60000);
   startBackupLoop();
 });
 
@@ -994,6 +1057,7 @@ if (!lastRun) lastRun = Date.now();
     const now = Date.now();
 const seconds = (now - lastRun) / 1000;
 lastRun = now;
+    let cycleChanged = false;
 
    
 //online
@@ -1029,11 +1093,12 @@ if (!stillOnline) {
   }
 
   delete liveTracker[id];
+  cycleChanged = true;
 }
 }
 
 // 🔥 CARGAR GP DESDE GIST
-const gpData = await loadUserGPs();
+const gpData = await loadUserGPsCached();
     
 
 for (const [id, data] of Object.entries(gpData)) {
@@ -1060,6 +1125,7 @@ for (const [id, data] of Object.entries(gpData)) {
   const gpDiff = Math.max(0, newGpCount - oldGpCount);
 
 if (gpDiff > 0) {
+  cycleChanged = true;
   console.log(
     `🌟 GP detected for ${trackingData[id].name || id}: +${gpDiff} GP`
   );
@@ -1130,6 +1196,7 @@ if (Date.now() < t.boostUntil) {
 const xpPerSecond = xpPerMinute / 60;
 
 t.sessionXP += xpPerSecond * seconds;
+    cycleChanged = true;
     // 🔥 XP independiente para Pokémon
 
 
@@ -1139,8 +1206,19 @@ t.sessionXP += xpPerSecond * seconds;
 
 }
 
-    await updatePanels();
-    await updateRanking();
+   if (cycleChanged) {
+  trackingDirty = true;
+}
+
+    const nowForUpdates = Date.now();
+
+if (
+  onlineIds.length > 0 &&
+  nowForUpdates - lastPanelsUpdate >= PANEL_UPDATE_MS
+) {
+  lastPanelsUpdate = nowForUpdates;
+  await updatePanels();
+}
 
   } catch (error) {
     console.error("❌ Error en runTrackingCycle:", error);
@@ -1312,7 +1390,7 @@ function createColorMenu(type, userId, category) {
 
 
   try {
-
+let heartbeatChanged = false;
     // 🔥 Canal global de heartbeat
     const channel = await client.channels.fetch(GLOBAL_HEARTBEAT_CHANNEL_ID);
     if (!channel) return;
@@ -1391,6 +1469,8 @@ console.log(
       // =====================
 // 📦 PACKS
 // =====================
+      const oldCurrentPacks = Number(trackingData[id].currentpacks) || 0;
+const oldLastPacks = Number(trackingData[id].lastHeartbeatPacks) || 0;
 const packsMatch = content.match(/packs:\s*(\d+)/i);
 
 if (packsMatch) {
@@ -1409,6 +1489,12 @@ if (packsMatch) {
   }
 
   trackingData[id].lastHeartbeatPacks = current;
+  if (
+  oldCurrentPacks !== Number(trackingData[id].currentpacks) ||
+  oldLastPacks !== Number(trackingData[id].lastHeartbeatPacks)
+) {
+  heartbeatChanged = true;
+}
 }
       
 
@@ -1446,8 +1532,11 @@ if (!liveTracker[id]) {
     group: eliteUsers[id]?.group || "trainer"
   };
 }
-
+const oldInstances = Number(liveTracker[id].instances) || 0;
 liveTracker[id].instances = instances;
+        if (oldInstances !== instances) {
+  heartbeatChanged = true;
+}
 
         if (instances > (trackingData[id].recordInstances || 0)) {
           trackingData[id].recordInstances = instances;
@@ -1465,7 +1554,9 @@ liveTracker[id].instances = instances;
     }
  
 
-    await redisSetJSON("tracking_data", trackingData);
+   if (heartbeatChanged) {
+  trackingDirty = true;
+}
 
   } catch (err) {
     console.error("❌ Error escaneando heartbeat global:", err.message);
@@ -1976,7 +2067,7 @@ async function reorderPanelsByBackground() {
 
         const { file } = await renderPanel(id, channel);
 
-        const post = await client.channels.fetch(userPanels[id].postId).catch(() => null);
+        const post = await getProfilePostCached(userPanels[id].postId);
 
         const sent = await channel.send({
           files: [file],
@@ -2012,7 +2103,6 @@ async function updatePanels() {
   return;
 }
   const channel = await client.channels.fetch(process.env.STATS_CHANNEL_ID);
-
   const panelIds = sortPanelIdsForDisplay(Object.keys(liveTracker));
 
   for (const id of panelIds) {
@@ -2038,10 +2128,7 @@ if (userPanels[id]?.messageId) {
   let msg = null;
 
   try {
-    msg = await channel.messages.fetch({
-      message: userPanels[id].messageId,
-      force: true
-    });
+   msg = await channel.messages.fetch(userPanels[id].messageId);
   } catch {}
 
   if (!msg) {
@@ -2051,7 +2138,7 @@ if (userPanels[id]?.messageId) {
   } else {
 
     // 🔁 Editar panel
-const post = await client.channels.fetch(userPanels[id].postId).catch(() => null);
+const post = await getProfilePostCached(userPanels[id].postId);
 
 const username =
   liveTracker[id]?.name ||
@@ -2068,9 +2155,7 @@ if (!post) {
   console.log(`⚠️ Post no encontrado (${id}), recreando perfil...`);
 }
 
-if (post) {
-  savePanels();
-}
+
     }
 
     continue; // 🔥 IMPORTANTE
@@ -2799,7 +2884,7 @@ if (!liveTracker[id]) {
   const { file } = await renderPanel(id, channel);
   const msg = await channel.messages.fetch(userPanels[id].messageId);
 
-const post = await client.channels.fetch(userPanels[id].postId).catch(() => null);
+const post = await getProfilePostCached(userPanels[id].postId);
 
 const username =
   liveTracker[id]?.name ||
@@ -3105,10 +3190,22 @@ const rankings = [
 
 function startLoop() {
   runTrackingCycle();
-  setInterval(runTrackingCycle, 300000);
 
-  updateRanking();
-  setInterval(updateRanking, 300000);
+  setInterval(async () => {
+    await runTrackingCycle();
+
+    const now = Date.now();
+
+ if (trackingDirty && now - lastRankingUpdate >= RANKING_UPDATE_MS) {
+  lastRankingUpdate = now;
+  await updateRanking();
+}
+    if (trackingDirty && now - lastTrackingSave >= TRACKING_SAVE_MS) {
+      lastTrackingSave = now;
+      trackingDirty = false;
+      await redisSetJSON("tracking_data", trackingData);
+    }
+  }, 300000);
 }
 
 
@@ -3116,19 +3213,36 @@ function startLoop() {
 function startBackupLoop() {
   setInterval(async () => {
     try {
+      let changed = false;
+
       for (const id in liveTracker) {
-        flushLiveSession(id, "backup");
+        const s = liveTracker[id];
+
+        if (!s) continue;
+
+        if ((Number(s.sessionXP) || 0) > 0 || (Number(s.sessionTime) || 0) >= 60) {
+          flushLiveSession(id, "backup");
+          changed = true;
+        }
+      }
+
+      if (!changed && !trackingDirty) {
+        console.log("⏭️ Backup skipped: no tracking changes.");
+        return;
       }
 
       sanitizeTracking();
 
-      await redisSetJSON("tracking_data", trackingData);
+      trackingDirty = false;
+      lastTrackingSave = Date.now();
+
+      await redisSetJSON("tracking_data", trackingData, true);
 
       console.log("✅ tracking_data backup saved.");
     } catch (err) {
       console.error("❌ Error in startBackupLoop:", err);
     }
-  }, 600000);
+  }, BACKUP_SAVE_MS);
 }
 
 // =============================
@@ -3160,28 +3274,52 @@ function sanitizeTracking() {
   }
 }
 
-async function loadOnlineData() {
-  const entries = Object.entries(GROUPS);
+let cachedOnlineData = null;
 
-  const results = await Promise.all(
-    entries.map(async ([groupName, group]) => ({
-      groupName,
-      ids: await redisLoadOnlineIds(group.redisGroup)
+async function loadOnlineData(force = false) {
+  const now = Date.now();
+
+  if (!force && cachedOnlineData && now - lastOnlineFetch < ONLINE_CACHE_MS) {
+    return cachedOnlineData;
+  }
+
+  const uniqueRedisGroups = {};
+
+  for (const [groupName, group] of Object.entries(GROUPS)) {
+    if (!uniqueRedisGroups[group.redisGroup]) {
+      uniqueRedisGroups[group.redisGroup] = [];
+    }
+
+    uniqueRedisGroups[group.redisGroup].push(groupName);
+  }
+
+  const redisResults = await Promise.all(
+    Object.entries(uniqueRedisGroups).map(async ([redisGroup, groupNames]) => ({
+      redisGroup,
+      groupNames,
+      ids: await redisLoadOnlineIds(redisGroup)
     }))
   );
 
   const map = {};
   let all = [];
 
-  for (const r of results) {
-    map[r.groupName] = r.ids;
-    all.push(...r.ids);
+  for (const result of redisResults) {
+    for (const groupName of result.groupNames) {
+      map[groupName] = result.ids;
+    }
+
+    all.push(...result.ids);
   }
 
-  return {
+  cachedOnlineData = {
     groupOnlineMap: map,
     onlineIds: [...new Set(all)]
   };
+
+  lastOnlineFetch = now;
+
+  return cachedOnlineData;
 }
 
 client.login(process.env.DISCORD_TOKEN);
