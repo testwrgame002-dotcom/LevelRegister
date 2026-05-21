@@ -83,12 +83,46 @@ function heartbeatMatchesUser(rawHeartbeatName, user) {
 
     if (!cleanCandidate) return false;
 
-    return (
-      cleanCandidate === hb ||
-      cleanCandidate.includes(hb) ||
-      hb.includes(cleanCandidate)
-    );
+    return cleanCandidate === hb;
   });
+}
+
+function getMatchedAliasKey(rawHeartbeatName, user) {
+  const hb = normalizeNameForMatch(rawHeartbeatName);
+
+  if (!hb) return null;
+
+  for (const candidate of getUserNameCandidates(user)) {
+    const cleanCandidate = normalizeNameForMatch(candidate);
+
+    if (!cleanCandidate) continue;
+
+    if (cleanCandidate === hb) {
+      return cleanCandidate;
+    }
+  }
+
+  return hb;
+}
+
+function parseHeartbeatPacks(content) {
+  const packsMatch = String(content || "").match(/packs:\s*(\d+)/i);
+  return packsMatch ? Number(packsMatch[1]) : 0;
+}
+
+function parseHeartbeatInstances(content) {
+  const onlineMatch = String(content || "").match(/online\s*[:\-]?\s*(.+)/i);
+
+  if (!onlineMatch) return 0;
+
+  return onlineMatch[1]
+    .split(",")
+    .map(x => x.trim().toLowerCase())
+    .filter(x =>
+      x !== "" &&
+      x !== "main" &&
+      x !== "none"
+    ).length;
 }
 
 function getDisplayNameForUser(id) {
@@ -1385,184 +1419,191 @@ function createColorMenu(type, userId, category) {
 
 // =============================scanHeartbeats____scanHeartbeats
 
- async function scanHeartbeats() {
+
+async function scanHeartbeats() {
   console.log("🔎 Escaneando heartbeats (GLOBAL)...");
 
-
   try {
-let heartbeatChanged = false;
-    // 🔥 Canal global de heartbeat
+    let heartbeatChanged = false;
+
     const channel = await client.channels.fetch(GLOBAL_HEARTBEAT_CHANNEL_ID);
     if (!channel) return;
 
-    // 🔥 Traer más mensajes
     const messages = await channel.messages.fetch({ limit: 50 });
 
     const latestByUser = {};
 
-  for (const msg of messages.values()) {
-
-  // Solo aceptar mensajes de bots
-  if (!msg.author.bot) continue;
-
-// 🔥 LIMPIAR mensaje primero
-let content = msg.content.replace(/```/g, "").trim();
-
-// 🔥 ahora sí dividir
-const lines = content.split("\n");
-if (!lines.length) continue;
-
-// 🔥 nombre correcto
-const rawName = lines[0].trim();
-
-const userEntry = Object.entries(eliteUsers)
-  .find(([id, user]) => heartbeatMatchesUser(rawName, user));
-
-console.log("RAW HEARTBEAT:", rawName);
-
-if (!userEntry) {
-  console.log("⚠️ HEARTBEAT SIN MATCH:", rawName);
-  continue;
-}
-
-const [id, matchedUser] = userEntry;
-
-console.log(
-  "✅ HEARTBEAT MATCH:",
-  rawName,
-  "=>",
-  matchedUser.name,
-  "| heartbeatName:",
-  matchedUser.heartbeatName || "none"
-);
-
-      if (!latestByUser[id]) {
-        latestByUser[id] = msg;
-      }
-    }
-
-    // 🔥 Procesar usuarios encontrados
-    for (const [id, msg] of Object.entries(latestByUser)) {
-
-      if (!trackingData[id]) {
- trackingData[id] = {
-  name: eliteUsers[id].name || "Unknown",
-  heartbeatName: eliteUsers[id].heartbeatName || eliteUsers[id].name || "Unknown",
-  xp: 0,
-  time: 0,
-  totalpacks: 0,
-  currentpacks: 0,
-  lastHeartbeatPacks: 0,
-  gp: 0,
-  recordInstances: 0,
-  lastHeartbeatMessageId: null
-};
-      }
-
-    
+    for (const msg of messages.values()) {
+      if (!msg.author.bot) continue;
 
       let content = msg.content.replace(/```/g, "").trim();
 
-      // =====================
-      // 📦 PACKS
-      // =====================
-      // =====================
-// 📦 PACKS
-// =====================
-      const oldCurrentPacks = Number(trackingData[id].currentpacks) || 0;
-const oldLastPacks = Number(trackingData[id].lastHeartbeatPacks) || 0;
-const packsMatch = content.match(/packs:\s*(\d+)/i);
+      const lines = content.split("\n");
+      if (!lines.length) continue;
 
-if (packsMatch) {
+      const rawName = lines[0].trim();
 
-  const current = Number(packsMatch[1]);
+      const userEntry = Object.entries(eliteUsers)
+        .find(([id, user]) => heartbeatMatchesUser(rawName, user));
 
-  if (trackingData[id].lastHeartbeatPacks === undefined) {
-    trackingData[id].lastHeartbeatPacks = current;
-  }
+      console.log("RAW HEARTBEAT:", rawName);
 
-  if (current < trackingData[id].lastHeartbeatPacks) {
-    trackingData[id].totalpacks += trackingData[id].currentpacks;
-    trackingData[id].currentpacks = current;
-  } else {
-    trackingData[id].currentpacks = current;
-  }
-
-  trackingData[id].lastHeartbeatPacks = current;
-  if (
-  oldCurrentPacks !== Number(trackingData[id].currentpacks) ||
-  oldLastPacks !== Number(trackingData[id].lastHeartbeatPacks)
-) {
-  heartbeatChanged = true;
-}
-}
-      
-
-      // =====================
-      // 🥇 INSTANCIAS
-      // =====================
-      const onlineMatch = content.match(/online\s*[:\-]?\s*(.+)/i);
-
-      if (onlineMatch) {
-
-        const rawOnline = onlineMatch[1];
-
-    const instances = rawOnline
-  .split(",")
-  .map(x => x.trim().toLowerCase())
-  .filter(x =>
-    x !== "" &&
-    x !== "main" &&
-    x !== "none"
-  ).length;
-if (!liveTracker[id]) {
-  liveTracker[id] = {
-    sessionXP: 0,
-    sessionTime: 0,
-    instances: 1,
-    boostUntil: 0,
-    name: trackingData[id]?.name || eliteUsers[id]?.name || "Unknown",
-    heartbeatName:
-      trackingData[id]?.heartbeatName ||
-      eliteUsers[id]?.heartbeatName ||
-      trackingData[id]?.name ||
-      "Unknown",
-    packs: 0,
-    gp: trackingData[id]?.gp || 0,
-    group: eliteUsers[id]?.group || "trainer"
-  };
-}
-const oldInstances = Number(liveTracker[id].instances) || 0;
-liveTracker[id].instances = instances;
-        if (oldInstances !== instances) {
-  heartbeatChanged = true;
-}
-
-        if (instances > (trackingData[id].recordInstances || 0)) {
-          trackingData[id].recordInstances = instances;
-        }
-
-        console.log(
-  "🥇 INSTANCES:",
-  eliteUsers[id].name,
-  "| heartbeat:",
-  eliteUsers[id].heartbeatName || eliteUsers[id].name,
-  instances
-);
+      if (!userEntry) {
+        console.log("⚠️ HEARTBEAT SIN MATCH:", rawName);
+        continue;
       }
 
-    }
- 
+      const [id, matchedUser] = userEntry;
+      const aliasKey = getMatchedAliasKey(rawName, matchedUser);
 
-   if (heartbeatChanged) {
-  trackingDirty = true;
-}
+      if (!aliasKey) continue;
+
+      console.log(
+        "✅ HEARTBEAT MATCH:",
+        rawName,
+        "=>",
+        matchedUser.name,
+        "| aliasKey:",
+        aliasKey
+      );
+
+      if (!latestByUser[id]) {
+        latestByUser[id] = {};
+      }
+
+      if (!latestByUser[id][aliasKey]) {
+        latestByUser[id][aliasKey] = {
+          msg,
+          rawName
+        };
+      }
+    }
+
+    for (const [id, aliasMessages] of Object.entries(latestByUser)) {
+      if (!trackingData[id]) {
+        trackingData[id] = {
+          name: eliteUsers[id].name || "Unknown",
+          heartbeatName: eliteUsers[id].heartbeatName || eliteUsers[id].name || "Unknown",
+          xp: 0,
+          time: 0,
+          totalpacks: 0,
+          currentpacks: 0,
+          lastHeartbeatPacks: 0,
+          lastHeartbeatPacksByAlias: {},
+          gp: 0,
+          recordInstances: 0,
+          lastHeartbeatMessageId: null
+        };
+      }
+
+      if (!trackingData[id].lastHeartbeatPacksByAlias) {
+        trackingData[id].lastHeartbeatPacksByAlias = {};
+      }
+
+      const oldCurrentPacks = Number(trackingData[id].currentpacks) || 0;
+      const oldRecordInstances = Number(trackingData[id].recordInstances) || 0;
+
+      let totalCurrentPacks = 0;
+      let totalInstances = 0;
+      let lastMessageId = null;
+
+      for (const [aliasKey, data] of Object.entries(aliasMessages)) {
+        const msg = data.msg;
+        const rawName = data.rawName;
+
+        let content = msg.content.replace(/```/g, "").trim();
+
+        const currentPacks = parseHeartbeatPacks(content);
+        const instances = parseHeartbeatInstances(content);
+
+        const previousAliasPacks =
+          trackingData[id].lastHeartbeatPacksByAlias[aliasKey];
+
+        if (previousAliasPacks === undefined) {
+          trackingData[id].lastHeartbeatPacksByAlias[aliasKey] = currentPacks;
+        } else if (currentPacks < previousAliasPacks) {
+          trackingData[id].totalpacks =
+            (Number(trackingData[id].totalpacks) || 0) +
+            previousAliasPacks;
+        }
+
+        trackingData[id].lastHeartbeatPacksByAlias[aliasKey] = currentPacks;
+
+        totalCurrentPacks += currentPacks;
+        totalInstances += instances;
+
+        lastMessageId = msg.id;
+
+        console.log(
+          "🥇 ALIAS STATS:",
+          eliteUsers[id].name,
+          "| heartbeat:",
+          rawName,
+          "| packs:",
+          currentPacks,
+          "| instances:",
+          instances
+        );
+      }
+
+      trackingData[id].currentpacks = totalCurrentPacks;
+      trackingData[id].lastHeartbeatPacks = totalCurrentPacks;
+      trackingData[id].lastHeartbeatMessageId = lastMessageId;
+
+      if (!liveTracker[id]) {
+        liveTracker[id] = {
+          sessionXP: 0,
+          sessionTime: 0,
+          instances: 1,
+          boostUntil: 0,
+          name: trackingData[id]?.name || eliteUsers[id]?.name || "Unknown",
+          heartbeatName:
+            trackingData[id]?.heartbeatName ||
+            eliteUsers[id]?.heartbeatName ||
+            trackingData[id]?.name ||
+            "Unknown",
+          packs: 0,
+          gp: trackingData[id]?.gp || 0,
+          group: eliteUsers[id]?.group || "trainer"
+        };
+      }
+
+      const oldInstances = Number(liveTracker[id].instances) || 0;
+
+      liveTracker[id].instances = totalInstances;
+      liveTracker[id].packs = totalCurrentPacks;
+
+      if (totalInstances > (trackingData[id].recordInstances || 0)) {
+        trackingData[id].recordInstances = totalInstances;
+      }
+
+      if (
+        oldCurrentPacks !== Number(trackingData[id].currentpacks) ||
+        oldInstances !== Number(liveTracker[id].instances) ||
+        oldRecordInstances !== Number(trackingData[id].recordInstances)
+      ) {
+        heartbeatChanged = true;
+      }
+
+      console.log(
+        "✅ TOTAL USER STATS:",
+        eliteUsers[id].name,
+        "| packs:",
+        totalCurrentPacks,
+        "| instances:",
+        totalInstances
+      );
+    }
+
+    if (heartbeatChanged) {
+      trackingDirty = true;
+    }
 
   } catch (err) {
     console.error("❌ Error escaneando heartbeat global:", err.message);
   }
-
 }
+
 function ensureUserProfile(id) {
   if (!userProfiles[id]) {
     userProfiles[id] = {
